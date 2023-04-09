@@ -1,6 +1,6 @@
-#include <math.h>   // smallmmlt, multiplexed MLT by Toshiya Hachisuka
+#include <math.h>   // smallpssmlt, primary sample space MLT by Toshiya Hachisuka
 #include <stdlib.h> // derived from smallpt, a path tracer by Kevin Beason, 2008
-#include <stdio.h>  // Usage: ./smallmmlt time_sec
+#include <stdio.h>  // Usage: ./smallpssmlt time_sec
 // 2015/01/26: Changed the default parameters. Fixed the bug that the normal was incorrectly flipped for diffuse surfaces (thanks to Hao Qin).
 
 
@@ -10,7 +10,7 @@
 
 
 // parameters
-#define MinPathLength 3// avoid sampling direct illumination
+#define MinPathLength 3 // avoid sampling direct illumination
 #define MaxPathLength 20
 #define Glossiness 25.0
 #define PixelWidth 640
@@ -23,8 +23,8 @@
 #define NumRNGsPerEvent 2
 #define MaxEvents (MaxPathLength + 1)
 #define NumStatesSubpath ((MaxEvents + 2) * NumRNGsPerEvent)
-#define NumStates (NumStatesSubpath * 2 + 1)
-#define TechniqueState (NumStates - 1) // use the last state as the technique state
+#define NumStates (NumStatesSubpath * 2)
+
 
 
 // time measurement
@@ -513,7 +513,7 @@ PathContribution CombinePaths(const Path EyePath, const Path LightPath, const in
 
 			// return immediately if the technique is specified
 			if ( Specified && (SpecifiedNumEyeVertices == NumEyeVertices) && (SpecifiedNumLightVertices == NumLightVertices) ) return Result;
-		}
+	  }
 	}
 	return Result;
 }
@@ -530,83 +530,55 @@ int main(int argc, char *argv[]) {
 
 	struct timeval startTime, currentTime;
 
-	// MMLT
-	// estimate normalization constants
-	double b[MaxPathLength];
-	for (int k = 0; k < MaxPathLength; k++) {
-		b[k] = 0.0;
-		for (int i = 0; i < N_Init; i++) {
-			fprintf(stderr, "\rMMLT Initializing: %5.2f", 100.0 * (i + k*N_Init)/(N_Init * MaxPathLength));
-			InitRandomNumbers();
-
-			// randomly select a technique (t should be at least one since we have a pinhole camera)
-			const int t = MIN( k+1, int(rnd() * (k + 2)) ) + 1;
-			const int s = (k+2) - t;
-
-			// specify the technique and do connection
-			b[k] = b[k] + CombinePaths(GenerateEyePath(t), GenerateLightPath(s), t, s).sc;
-		}
-		b[k] /= double(N_Init);
+	// PSSMLT
+	// estimate normalization constant
+	double b = 0.0;
+	for (int i = 0; i < N_Init; i++) {
+		fprintf(stderr, "\rPSSMLT Initializing: %5.2f", 100.0 * i / (N_Init));
+		InitRandomNumbers();
+		b += CombinePaths(GenerateEyePath(MaxEvents), GenerateLightPath(MaxEvents)).sc;
 	}
-
-	// construct the PDF and the CDF for selecting the path length
-	double PDF_b[MaxPathLength], CDF_b[MaxPathLength];
-	CDF_b[0] = b[0];
-	for (int k = 1; k < MaxPathLength; k++) CDF_b[k] = CDF_b[k - 1] + b[k];
-	for (int k = 0; k < MaxPathLength; k++) {
-		PDF_b[k] = b[k] / CDF_b[MaxPathLength - 1];
-		CDF_b[k] = CDF_b[k] / CDF_b[MaxPathLength - 1];
-	}
+	b /= double(N_Init);
 	fprintf(stderr, "\n");
 
-	// initialize Markov chains
-	// we use multiple chains for different path lengths (see the paper for the reasoning)
-	TMarkovChain current[MaxPathLength], proposal;
-	for (int k = 0; k < MaxPathLength; k++) {
-		const int t = MIN( k+1, int(current[k].u[TechniqueState] * (k+2)) ) + 1;
-		const int s = (k+2) - t;
-		InitRandomNumbersByChain(current[k]);
-		current[k].C = CombinePaths(GenerateEyePath(t), GenerateLightPath(s), t, s);
-	}
-		
-	gettimeofday(&startTime, NULL);
+	// initialize the Markov chain
+	TMarkovChain current, proposal;
+	InitRandomNumbersByChain(current);
+	current.C = CombinePaths(GenerateEyePath(MaxEvents), GenerateLightPath(MaxEvents));
 
+	gettimeofday(&startTime, NULL);
+	
 	// integration
 	for (;;) {
 		samps++;
-		fprintf(stderr, "\rMMLT %c", progr[(samps>>8)&3]);
+		fprintf(stderr, "\rPSSMLT %c", progr[(samps>>8)&3]);
 		if (samps % PixelWidth) {
 			gettimeofday(&currentTime, NULL);
 			if ( ltime < ((currentTime.tv_sec - startTime.tv_sec) + (currentTime.tv_usec - startTime.tv_usec) * 1.0E-6) ) break;
 		}
 
-		// select the path length (note that k = 0 corresponds to the path length one)
-		const double r = rnd(); int k = 0; while (r > CDF_b[k]) k++;
-
 		// sample the path
 		double isLargeStepDone;
 		if (rnd() <= LargeStepProb) {
-			proposal = current[k].large_step(); isLargeStepDone = 1.0;
+			proposal = current.large_step(); isLargeStepDone = 1.0;
 		} else {
-			proposal = current[k].mutate(); isLargeStepDone = 0.0;
+			proposal = current.mutate(); isLargeStepDone = 0.0;
 		}
 		InitRandomNumbersByChain(proposal);
-		int t = MIN( k+1, int(proposal.u[TechniqueState] * (k+2)) ) + 1; // we ensure that t >= 1 since we have a pinhole camera
-		int s = (k+2) - t;
-		proposal.C = CombinePaths(GenerateEyePath(t), GenerateLightPath(s), t, s);
+		proposal.C = CombinePaths(GenerateEyePath(MaxEvents), GenerateLightPath(MaxEvents));
 
-		double a = 1.0; if (current[k].C.sc > 0.0) a = MAX(MIN(1.0, proposal.C.sc / current[k].C.sc), 0.0);
+		double a = 1.0; if (current.C.sc > 0.0) a = MAX(MIN(1.0, proposal.C.sc / current.C.sc), 0.0);
 
 		// accumulate samples
-		if (proposal.C.sc > 0.0) AccumulatePathContribution(proposal.C, (k+2)/PDF_b[k] *(a + isLargeStepDone)/(proposal.C.sc/b[k] + LargeStepProb));
-		if (current[k].C.sc > 0.0) AccumulatePathContribution(current[k].C, (k+2)/PDF_b[k] *(1.0 - a)/(current[k].C.sc/b[k] + LargeStepProb));
+		if (proposal.C.sc > 0.0) AccumulatePathContribution(proposal.C, (a + isLargeStepDone)/(proposal.C.sc/b + LargeStepProb));
+		if (current.C.sc > 0.0) AccumulatePathContribution(current.C, (1.0 - a)/(current.C.sc/b + LargeStepProb));
 
 		// update the chain
-		if (rnd() <= a) current[k] = proposal;
+		if (rnd() <= a) current = proposal;
 	}
 
 	// write out .ppm
-	f = fopen("image_mmlt.ppm","wb");
+	f = fopen("image_pssmlt.ppm","wb");
 	fprintf(f,"P6\n%d %d\n%d\n", PixelWidth, PixelHeight, 255);
 	double s = double(PixelWidth * PixelHeight) / double(samps);
 	for(int i = 0; i< PixelWidth * PixelHeight; i++) {
